@@ -1,10 +1,6 @@
 {
   "predictions": [
     {
-      "frame": 142,
-      "action": "interception"
-    },
-    {
       "frame": 196,
       "action": "pass"
     },
@@ -29,7 +25,7 @@
       "action": "pass_received"
     },
     {
-      "frame": 476,
+      "frame": 450,
       "action": "pass"
     },
     {

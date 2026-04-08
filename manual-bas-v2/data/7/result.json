@@ -17,11 +17,7 @@
       "action": "pass_received"
     },
     {
-      "frame": 484,
-      "action": "interception"
-    },
-    {
-      "frame": 485,
+      "frame": 488,
       "action": "pass"
     },
     {
@@ -43,14 +39,6 @@
     {
       "frame": 615,
       "action": "pass_received"
-    },
-    {
-      "frame": 631,
-      "action": "interception"
-    },
-    {
-      "frame": 734,
-      "action": "interception"
     }
   ]
 }

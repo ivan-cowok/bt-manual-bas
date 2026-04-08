@@ -52,6 +52,17 @@ class Config:
     dribble_max_flight_frames: int = 10
     # Max in-flight frames for an interception (longer = recovery, not interception)
     interception_max_flight_frames: int = 20
+    # Frames to wait after a potential interception before confirming/rejecting it.
+    # During the wait we check post-contact ball velocity for physical evidence.
+    interception_confirm_frames: int = 3
+    # Case 1 — ball absorbed: speed_after / speed_before < this ratio → genuine
+    interception_speed_drop_ratio: float = 0.5
+    # Case 2 — ball deflected: direction change (degrees) > this → genuine
+    interception_direction_change_deg: float = 60.0
+    # Spike-filter for vel_before: if the most recent pre-contact velocity
+    # exceeds this multiple of the one before it, treat it as a tracker
+    # glitch and use the calmer, earlier reading instead.
+    interception_vel_spike_ratio: float = 1.9
     # Max consecutive loose-ball frames while in POSSESSED before resetting to DEAD
     pass_held_loose_max_frames: int = 7
     # After a "recovery" event, the new possessor may have obtained the ball via a

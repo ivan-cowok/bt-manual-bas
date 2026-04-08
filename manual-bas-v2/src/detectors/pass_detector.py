@@ -1,3 +1,4 @@
+import math
 from collections import deque
 from typing import Deque, FrozenSet, List, Optional
 
@@ -71,6 +72,15 @@ class PassDetector:
         self._reception_candidate_count: int = 0
         self._consecutive_ball_absent: int = 0  # absent frames during IN_FLIGHT
 
+        # --- Interception confirmation (physics-based look-ahead guard) ---
+        # Velocity history (last N frames) for direction-change detection
+        self._vel_history: Deque[Optional[Vector2D]] = deque(maxlen=8)
+        # Pending interception — buffered while we collect post-contact velocities
+        self._pending_interception_event: Optional[Event] = None
+        self._pending_interception_possession: Optional[FramePossession] = None
+        self._pending_interception_post_vels: List[Optional[Vector2D]] = []
+        self._pending_interception_vel_before: Optional[Vector2D] = None
+
         # --- DEAD context ---
         self._dead_frames: int = 0           # frames of stationary + no possessor
 
@@ -87,6 +97,9 @@ class PassDetector:
     ) -> List[Event]:
         speed = BallVelocityCalculator.speed(velocity)
 
+        # Keep a rolling velocity history for interception direction analysis
+        self._vel_history.append(velocity)
+
         if self._state == BallState.DEAD:
             return self._on_dead(frame, possession, speed)
         if self._state == BallState.POSSESSED:
@@ -94,7 +107,7 @@ class PassDetector:
         if self._state == BallState.CONTESTED:
             return self._on_contested(frame, possession, speed, lookback)
         if self._state == BallState.IN_FLIGHT:
-            return self._on_in_flight(frame, possession, speed)
+            return self._on_in_flight(frame, possession, speed, velocity)
         return []
 
     # ------------------------------------------------------------------
@@ -242,7 +255,8 @@ class PassDetector:
         return []
 
     def _on_in_flight(
-        self, frame: Frame, possession: FramePossession, speed: float
+        self, frame: Frame, possession: FramePossession, speed: float,
+        velocity: Optional[Vector2D],
     ) -> List[Event]:
         self._flight_frames += 1
         self._peak_speed = max(self._peak_speed, speed)
@@ -255,6 +269,13 @@ class PassDetector:
         if self._flight_frames > max_frames:
             self._enter_dead()
             return []
+
+        # -------------------------------------------------------------------
+        # Pending interception: collecting post-contact velocity data to
+        # confirm or reject before emitting.
+        # -------------------------------------------------------------------
+        if self._pending_interception_event is not None:
+            return self._process_pending_interception(frame, possession, velocity)
 
         if not possession.ball_detected:
             self._consecutive_ball_absent += 1
@@ -324,6 +345,20 @@ class PassDetector:
             self._reception_candidate_team = None
             self._reception_candidate_count = 0
 
+        # -------------------------------------------------------------------
+        # Interception confirmation guard: buffer instead of emitting
+        # immediately.  Physical validation (speed drop OR direction change)
+        # happens after interception_confirm_frames look-ahead frames.
+        # -------------------------------------------------------------------
+        is_interception_candidate = (
+            self._kicker_known
+            and possession.team != self._kicker_team
+            and self._flight_frames <= self.config.interception_max_flight_frames
+        )
+        if is_interception_candidate:
+            self._buffer_pending_interception(frame, possession)
+            return []
+
         events = self._classify_reception(frame, possession)
         # If the reception was a recovery (unknown kicker), flag the new possession
         # so that a very-brief subsequent kick is also treated as unknown.
@@ -380,6 +415,148 @@ class PassDetector:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    # --- Interception confirmation helpers ----------------------------
+
+    def _buffer_pending_interception(
+        self, frame: Frame, possession: FramePossession
+    ) -> None:
+        """Save an interception candidate; collect post-contact velocities next."""
+        # Identify the best pre-contact velocity reference.
+        # A single-frame tracker glitch (ball position mis-detected near an
+        # opposing player) can produce a sudden speed spike followed by a
+        # "drop" back to normal — causing Case-1 (speed drop) to fire falsely.
+        # If the most recent velocity is more than interception_vel_spike_ratio×
+        # the velocity one frame earlier, treat it as a glitch and use the
+        # earlier, calmer reading as vel_before.
+        history = list(self._vel_history)
+        pre_vels = [v for v in reversed(history[:-1]) if v is not None]
+
+        vel_before: Optional[Vector2D] = None
+        if len(pre_vels) >= 2:
+            v_latest = pre_vels[0]
+            v_prev   = pre_vels[1]
+            spd_latest = BallVelocityCalculator.speed(v_latest)
+            spd_prev   = BallVelocityCalculator.speed(v_prev)
+            if (
+                spd_prev > 0
+                and spd_latest > spd_prev * self.config.interception_vel_spike_ratio
+            ):
+                vel_before = v_prev   # use calmer earlier velocity
+            else:
+                vel_before = v_latest
+        elif len(pre_vels) == 1:
+            vel_before = pre_vels[0]
+        self._pending_interception_event = self._make_event(
+            "interception", frame, possession.team, 0.85
+        )
+        self._pending_interception_possession = possession
+        self._pending_interception_post_vels = []
+        self._pending_interception_vel_before = vel_before
+
+    def _process_pending_interception(
+        self,
+        frame: Frame,
+        possession: FramePossession,
+        velocity: Optional[Vector2D],
+    ) -> List[Event]:
+        """Called each frame while an interception is pending confirmation."""
+        self._pending_interception_post_vels.append(velocity)
+
+        # If kicker's own team clearly gets the ball → it was a pass, not an
+        # interception.  Cancel the pending and classify as pass_received.
+        if (
+            possession.ball_detected
+            and possession.team == self._kicker_team
+            and not possession.is_stale
+        ):
+            self._clear_pending_interception()
+            events = self._classify_reception(frame, possession)
+            is_recovery = any(e.event_type == "recovery" for e in events)
+            self._enter_possessed(possession, from_recovery=is_recovery)
+            return events
+
+        # Wait until we have enough post-contact frames
+        if (
+            len(self._pending_interception_post_vels)
+            < self.config.interception_confirm_frames
+        ):
+            return []
+
+        # Enough data — validate
+        confirmed = self._validate_pending_interception()
+        event = self._pending_interception_event
+        poss = self._pending_interception_possession
+        self._clear_pending_interception()
+
+        # Whether confirmed or not, enter possession for the intercepting team.
+        # Confirmed → emit interception event.
+        # Rejected  → silent possession change (no FP emitted).
+        self._enter_possessed(poss)  # type: ignore[arg-type]
+        return [event] if confirmed else []  # type: ignore[list-item]
+
+    def _validate_pending_interception(self) -> bool:
+        """
+        Return True if the buffered interception is physically plausible.
+
+        Case 1 — ball absorbed / stopped:
+            average speed after contact < speed_before × speed_drop_ratio
+
+        Case 2 — ball deflected / redirected:
+            angle between pre- and post-contact velocity > direction_change_deg
+
+        If we have no usable velocity data (ball absent), we conservatively
+        confirm (assume genuine interception).
+        """
+        vel_before = self._pending_interception_vel_before
+        post_vels = self._pending_interception_post_vels
+        post_vels_valid = [v for v in post_vels if v is not None]
+
+        speed_before = BallVelocityCalculator.speed(vel_before)
+
+        if not post_vels_valid:
+            # No data after contact — conservatively confirm
+            return True
+
+        speed_after = sum(
+            BallVelocityCalculator.speed(v) for v in post_vels_valid
+        ) / len(post_vels_valid)
+
+        # Case 1: speed dropped significantly (ball absorbed)
+        if speed_before > 0 and speed_after < speed_before * self.config.interception_speed_drop_ratio:
+            return True
+
+        # Case 2: direction changed sharply (ball deflected)
+        post_vel = next(iter(post_vels_valid), None)
+        angle = self._angle_between(vel_before, post_vel)
+        if angle >= self.config.interception_direction_change_deg:
+            return True
+
+        # Neither speed drop nor direction change — likely a false positive
+        return False
+
+    def _clear_pending_interception(self) -> None:
+        self._pending_interception_event = None
+        self._pending_interception_possession = None
+        self._pending_interception_post_vels = []
+        self._pending_interception_vel_before = None
+
+    @staticmethod
+    def _angle_between(
+        v1: Optional[Vector2D], v2: Optional[Vector2D]
+    ) -> float:
+        """Angle in degrees between two velocity vectors; 0 if either is None/zero."""
+        if v1 is None or v2 is None:
+            return 0.0
+        mag1 = math.sqrt(v1[0] ** 2 + v1[1] ** 2)
+        mag2 = math.sqrt(v2[0] ** 2 + v2[1] ** 2)
+        if mag1 < 0.5 or mag2 < 0.5:
+            return 0.0
+        cos_a = (v1[0] * v2[0] + v1[1] * v2[1]) / (mag1 * mag2)
+        cos_a = max(-1.0, min(1.0, cos_a))
+        return math.degrees(math.acos(cos_a))
+
+    # --- Other helpers ------------------------------------------------
 
     def _recover_kicker(
         self, lookback: Deque[FramePossession]
@@ -450,6 +627,7 @@ class PassDetector:
         self._reception_candidate_team = None
         self._reception_candidate_count = 0
         self._consecutive_ball_absent = 0
+        self._clear_pending_interception()
 
     def _enter_possessed(
         self, possession: FramePossession, from_dead: bool = False, from_recovery: bool = False
@@ -478,6 +656,7 @@ class PassDetector:
         self._reception_candidate_team = None
         self._reception_candidate_count = 0
         self._consecutive_ball_absent = 0
+        self._clear_pending_interception()
 
     def _enter_contested(self, possession: FramePossession) -> None:
         self._state = BallState.CONTESTED
@@ -508,3 +687,4 @@ class PassDetector:
         self._reception_candidate_team = None
         self._reception_candidate_count = 0
         self._consecutive_ball_absent = 0
+        self._clear_pending_interception()
