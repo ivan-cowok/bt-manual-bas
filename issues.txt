@@ -1,0 +1,17 @@
+video 9 
+
+frame: 120, player back passes
+frame: 165. goalkeeper recives passes
+
+frame 455: visually interception
+frame 497: visually interception
+
+
+
+video 8
+frame 473: team left player passes to goalkeeper
+frame: 500~503: team left goal keepr recives the pass
+
+frame 592: GK kicks goal
+frame 657: aerial fight happens (visually left team player wins the header and passes)
+frame 707: left team player gets the ball
