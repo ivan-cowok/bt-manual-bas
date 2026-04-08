@@ -1,36 +1,12 @@
 {
   "predictions": [
     {
-      "frame": 47,
+      "frame": 48,
       "action": "pass"
     },
     {
       "frame": 67,
       "action": "pass_received"
-    },
-    {
-      "frame": 280,
-      "action": "pass"
-    },
-    {
-      "frame": 292,
-      "action": "pass_received"
-    },
-    {
-      "frame": 332,
-      "action": "interception"
-    },
-    {
-      "frame": 450,
-      "action": "pass"
-    },
-    {
-      "frame": 454,
-      "action": "pass_received"
-    },
-    {
-      "frame": 497,
-      "action": "interception"
     },
     {
       "frame": 523,
