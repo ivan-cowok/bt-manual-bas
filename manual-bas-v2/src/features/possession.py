@@ -117,7 +117,10 @@ class PossessionTracker:
     def _is_eligible(self, player: PlayerDetection) -> bool:
         if player.team == "unknown":
             return False
-        if player.detection_confidence < self.config.min_detection_confidence:
+        if (
+            player.detection_confidence
+            < self.config.possession_min_detection_confidence
+        ):
             return False
         if (
             player.team_confidence is not None
