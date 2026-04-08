@@ -28,20 +28,19 @@ class BallVelocityCalculator:
         the ball (or confused it with another object).  The position jump is
         meaningless as velocity, so the chain is reset on an ID change.
 
-    Resets when:
+    Resets / returns None when:
         - Ball track_id changes (tracker re-acquisition)
         - Ball absent longer than max_chain_frames
+        - Frame gap > max_velocity_gap: multi-frame gaps (≥2 absent frames)
+          inflate the apparent speed because the ball may have bounced or
+          teleported during the gap.  Use None (speed = 0) to avoid false
+          IN-FLIGHT triggers from stale position differences.
         - Frame gap exceeds max_chain_frames (limits accumulated transform error)
     """
 
-    # Maximum plausible ball speed in pixels/frame at 25 fps.
-    # Real football max ~35 m/s; at typical camera scale ≈ 40 px/m → ~56 px/frame.
-    # Values above this threshold almost certainly indicate a tracker glitch
-    # (ball ID reuse, mis-detected object), not genuine ball motion.
-    MAX_PLAUSIBLE_SPEED: float = 55.0
-
-    def __init__(self, max_chain_frames: int = 25):
+    def __init__(self, max_chain_frames: int = 25, max_velocity_gap: int = 2):
         self.max_chain_frames = max_chain_frames
+        self.max_velocity_gap = max_velocity_gap
         self._prev_center: Optional[Vector2D] = None
         self._prev_frame_id: Optional[int] = None
         self._prev_track_id: Optional[int] = None
@@ -77,6 +76,15 @@ class BallVelocityCalculator:
 
         gap = frame.frame_id - self._prev_frame_id  # type: ignore[operator]
         if gap <= 0 or gap > self.max_chain_frames:
+            self._prev_center = current_center
+            self._prev_frame_id = frame.frame_id
+            self._prev_track_id = current_track_id
+            return None
+
+        # Multi-frame gaps (ball was absent for ≥2 consecutive frames) produce
+        # inflated apparent speeds that can trigger false IN-FLIGHT entries.
+        # Return None so the caller treats the speed as 0.
+        if gap > self.max_velocity_gap:
             self._prev_center = current_center
             self._prev_frame_id = frame.frame_id
             self._prev_track_id = current_track_id

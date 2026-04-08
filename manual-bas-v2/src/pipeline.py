@@ -35,7 +35,10 @@ class Pipeline:
 
     def __init__(self, config: Config):
         self.config = config
-        self._velocity_calc = BallVelocityCalculator(config.transform_max_chain_frames)
+        self._velocity_calc = BallVelocityCalculator(
+            config.transform_max_chain_frames,
+            config.max_velocity_gap,
+        )
         self._possession_tracker = PossessionTracker(config)
         self._pass_detector = PassDetector(config)
 

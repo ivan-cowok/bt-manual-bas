@@ -59,6 +59,10 @@ class Config:
     # same-team possession frames before attributing a subsequent kick to that team.
     # Applied ONLY after recovery events (not after pass/interception/dead).
     min_post_recovery_possession_frames: int = 3
+    # Minimum consecutive absence frames during IN_FLIGHT before we require
+    # 2 confirmation frames on the next reception (prevents premature
+    # pass_received at the first ball detection after a long ball-absent gap).
+    reception_long_absence_threshold: int = 5
 
     # ------------------------------------------------------------------ #
     # Shot suppressor (internal only — never emitted)                     #
@@ -78,6 +82,11 @@ class Config:
     # ------------------------------------------------------------------ #
     # Maximum affine-transform chain length before reset (limits drift)
     transform_max_chain_frames: int = 25
+    # Maximum consecutive-frame gap in the ball track before the velocity is
+    # considered unreliable (multi-frame NO-BALL gaps inflate apparent speed,
+    # causing false IN-FLIGHT entries from stale positions).  When the gap
+    # exceeds this value the velocity calculator returns None → speed = 0.
+    max_velocity_gap: int = 2
 
     # ------------------------------------------------------------------ #
     # NMS — per event type                                                 #

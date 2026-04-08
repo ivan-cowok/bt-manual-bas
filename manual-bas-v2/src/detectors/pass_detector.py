@@ -66,6 +66,11 @@ class PassDetector:
         self._flight_frames: int = 0
         self._peak_speed: float = 0.0
 
+        # --- Reception confirmation (long-absence guard) ---
+        self._reception_candidate_team: Optional[str] = None
+        self._reception_candidate_count: int = 0
+        self._consecutive_ball_absent: int = 0  # absent frames during IN_FLIGHT
+
         # --- DEAD context ---
         self._dead_frames: int = 0           # frames of stationary + no possessor
 
@@ -122,7 +127,7 @@ class PassDetector:
         self, frame: Frame, possession: FramePossession, speed: float
     ) -> List[Event]:
         self._pre_flight_peak_speed = max(
-            speed, self._pre_flight_peak_speed * 0.85
+            speed, self._pre_flight_peak_speed * 0.95
         )
 
         if not possession.ball_detected:
@@ -142,19 +147,30 @@ class PassDetector:
             return []
 
         if possession.team == "loose":
-            if speed >= self.config.ball_velocity_threshold:
-                # Ball kicked — enter flight, kicker is the possessed team.
-                # Exception: if this possession was established from a RECOVERY event
-                # and the team has had very few active frames (< min), the ball may
-                # have been picked up via a tracker glitch (e.g. ball teleporting near
-                # a player after a save/scramble).  Treat as unknown kicker (→ recovery,
-                # not emitted) to suppress false positive interceptions.
+            # Use rolling pre-flight peak speed alongside current speed: a ball
+            # kicked inside the possession radius may have already decelerated
+            # below ball_velocity_threshold by the time it clears the player's
+            # feet.  The peak speed signals that a genuine kick occurred.
+            # Guard: only use the peak as backup if the player had sufficient
+            # possession frames (pfc≥8) — very brief possessions may have a
+            # high pfps from dribble speed rather than a genuine kick.
+            pfps_backup = (
+                self._pre_flight_peak_speed if self._poss_frame_count >= 8 else 0.0
+            )
+            effective_speed = max(speed, pfps_backup)
+            if effective_speed >= self.config.ball_velocity_threshold:
                 stale = self._loose_frames
                 self._loose_frames = 0
+                # High-confidence kicks (very fast) always proceed regardless of
+                # post-recovery status — the speed alone confirms a genuine kick.
+                high_confidence_kick = (
+                    effective_speed >= self.config.ball_velocity_threshold * 3
+                )
                 post_recovery_glitch = (
                     self._poss_from_recovery
                     and self._poss_frame_count
                     < self.config.min_post_recovery_possession_frames
+                    and not high_confidence_kick
                 )
                 if stale > self.config.pass_held_loose_max_frames:
                     # Ball has been drifting loose too long — kicker attribution
@@ -241,27 +257,41 @@ class PassDetector:
             return []
 
         if not possession.ball_detected:
+            self._consecutive_ball_absent += 1
+            self._reception_candidate_team = None
+            self._reception_candidate_count = 0
             return []
+
+        # Record and reset consecutive absent counter now that ball is seen
+        prev_absent = self._consecutive_ball_absent
+        self._consecutive_ball_absent = 0
 
         if possession.team not in _KNOWN_TEAMS:
+            self._reception_candidate_team = None
+            self._reception_candidate_count = 0
             return []
 
-        # Contested arrival — ball reached both teams simultaneously; suppress event,
-        # enter CONTESTED and let it resolve before attributing the reception.
-        if possession.is_contested:
-            self._enter_contested(possession)
-            return []
+        # Contested arrival — don't abandon the flight; the stale check below
+        # will suppress false events while the duel is unresolved.  Entering
+        # CONTESTED from IN_FLIGHT was historically prone to losing the original
+        # flight context; letting the flight run through is cleaner and matches
+        # V1 behaviour.
 
         if self._flight_frames < self.config.pass_min_flight_frames:
             return []
 
-        # Stale different-team signal — ball passed near an opposing player but
-        # they haven't truly committed.  Keep the flight open.
-        if possession.is_stale and possession.team != self._kicker_team:
+        # Stale signal — ball passed near a player but they haven't truly
+        # committed.  Skip BOTH same-team (false dribble/pass_received) and
+        # cross-team (false interception) events until the signal is fresh.
+        if possession.is_stale:
+            self._reception_candidate_team = None
+            self._reception_candidate_count = 0
             return []
 
         # Dribble guard
         if self._is_dribble(possession):
+            self._reception_candidate_team = None
+            self._reception_candidate_count = 0
             self._enter_possessed(possession)
             return []
 
@@ -272,8 +302,27 @@ class PassDetector:
             and possession.team != self._kicker_team
             and self._peak_speed >= self.config.shot_min_peak_flight_speed
         ):
+            self._reception_candidate_team = None
+            self._reception_candidate_count = 0
             self._enter_possessed(possession)
             return []  # no emittable event
+
+        # Long-absence confirmation guard: if the ball reappeared after a long
+        # absence (≥ reception_long_absence_threshold frames), require 2
+        # consecutive valid reception frames before emitting.  This prevents
+        # premature pass_received events when the ball briefly "touches" a player
+        # after reappearing and then bounces away again.
+        if prev_absent >= self.config.reception_long_absence_threshold:
+            if possession.team != self._reception_candidate_team:
+                self._reception_candidate_team = possession.team
+                self._reception_candidate_count = 1
+            else:
+                self._reception_candidate_count += 1
+            if self._reception_candidate_count < 2:
+                return []
+            # 2nd frame confirmed — proceed to emit below
+            self._reception_candidate_team = None
+            self._reception_candidate_count = 0
 
         events = self._classify_reception(frame, possession)
         # If the reception was a recovery (unknown kicker), flag the new possession
@@ -398,6 +447,9 @@ class PassDetector:
         self._flight_frames = 0
         self._peak_speed = 0.0
         self._dead_frames = 0
+        self._reception_candidate_team = None
+        self._reception_candidate_count = 0
+        self._consecutive_ball_absent = 0
 
     def _enter_possessed(
         self, possession: FramePossession, from_dead: bool = False, from_recovery: bool = False
@@ -423,6 +475,9 @@ class PassDetector:
         self._flight_start_timestamp_ms = None
         self._flight_frames = 0
         self._peak_speed = 0.0
+        self._reception_candidate_team = None
+        self._reception_candidate_count = 0
+        self._consecutive_ball_absent = 0
 
     def _enter_contested(self, possession: FramePossession) -> None:
         self._state = BallState.CONTESTED
@@ -450,3 +505,6 @@ class PassDetector:
         self._peak_speed = self._pre_flight_peak_speed
         self._pre_flight_peak_speed = 0.0
         self._loose_frames = 0
+        self._reception_candidate_team = None
+        self._reception_candidate_count = 0
+        self._consecutive_ball_absent = 0
