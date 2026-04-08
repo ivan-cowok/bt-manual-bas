@@ -87,6 +87,12 @@ class FramePossession:
     # True when top-2 players are from different teams AND both within threshold
     is_contested: bool = False
 
+    # True when the ball position at this frame is a likely tracking glitch:
+    # the ball jumped a huge distance from the previous frame (backward check)
+    # AND the ball disappears in the very next frame (forward check).
+    # Set by the Pipeline pre-processing step, not by PossessionTracker.
+    ball_glitch: bool = False
+
 
 @dataclass
 class Event:

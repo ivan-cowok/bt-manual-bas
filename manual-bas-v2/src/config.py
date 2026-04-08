@@ -74,6 +74,12 @@ class Config:
     # 2 confirmation frames on the next reception (prevents premature
     # pass_received at the first ball detection after a long ball-absent gap).
     reception_long_absence_threshold: int = 5
+    # Ball position jump (px, raw pixel distance, no camera compensation) that
+    # combined with the ball disappearing in the NEXT frame, indicates a
+    # tracker glitch (e.g. a white boot briefly detected as the ball).
+    # The Pipeline marks FramePossession.ball_glitch=True when both conditions
+    # are met; the PassDetector then treats that frame as ball-not-detected.
+    ball_glitch_speed_threshold: float = 100.0
 
     # ------------------------------------------------------------------ #
     # Shot suppressor (internal only — never emitted)                     #

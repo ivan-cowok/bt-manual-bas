@@ -283,6 +283,16 @@ class PassDetector:
             self._reception_candidate_count = 0
             return []
 
+        # Ball glitch: position jumped a huge distance from the previous frame
+        # AND the ball disappears the very next frame — almost certainly a
+        # tracker mis-detection (e.g. a white boot labelled as the ball).
+        # Treat as ball-absent: don't fire any reception event this frame.
+        if possession.ball_glitch:
+            self._consecutive_ball_absent += 1
+            self._reception_candidate_team = None
+            self._reception_candidate_count = 0
+            return []
+
         # Record and reset consecutive absent counter now that ball is seen
         prev_absent = self._consecutive_ball_absent
         self._consecutive_ball_absent = 0
@@ -328,7 +338,7 @@ class PassDetector:
             self._enter_possessed(possession)
             return []  # no emittable event
 
-        # Long-absence confirmation guard: if the ball reappeared after a long
+        # 2-frame confirmation guard: if the ball reappeared after a long
         # absence (≥ reception_long_absence_threshold frames), require 2
         # consecutive valid reception frames before emitting.  This prevents
         # premature pass_received events when the ball briefly "touches" a player
