@@ -152,10 +152,15 @@ class PossessionTracker:
             self._reset_candidate()
             return self._committed_state(frame, is_contested, second_team, second_track_id)
 
-        # Different team from committed — accumulate candidate frames
+        # Different team from committed — accumulate candidate frames.
+        # EXCEPTION: contested frames do NOT count toward commitment.
+        # Committing to whoever is slightly closer during a duel creates false
+        # kicker attribution (→ spurious interceptions once the contest resolves).
         self._stale_count += 1
 
-        if team == self._candidate_team:
+        if is_contested:
+            self._reset_candidate()
+        elif team == self._candidate_team:
             self._candidate_count += 1
             self._candidate_track_id = primary.track_id
             self._candidate_bbox = primary.bbox

@@ -34,6 +34,12 @@ class BallVelocityCalculator:
         - Frame gap exceeds max_chain_frames (limits accumulated transform error)
     """
 
+    # Maximum plausible ball speed in pixels/frame at 25 fps.
+    # Real football max ~35 m/s; at typical camera scale ≈ 40 px/m → ~56 px/frame.
+    # Values above this threshold almost certainly indicate a tracker glitch
+    # (ball ID reuse, mis-detected object), not genuine ball motion.
+    MAX_PLAUSIBLE_SPEED: float = 55.0
+
     def __init__(self, max_chain_frames: int = 25):
         self.max_chain_frames = max_chain_frames
         self._prev_center: Optional[Vector2D] = None

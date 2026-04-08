@@ -46,6 +46,9 @@ class PassDetector:
         self._poss_player_role: Optional[str] = None
         self._loose_frames: int = 0          # ball loose while in POSSESSED
         self._pre_flight_peak_speed: float = 0.0  # rolling max speed in POSSESSED
+        self._poss_frame_count: int = 0      # same-team frames since possession committed
+        self._poss_from_dead: bool = False   # True if possession was established from DEAD
+        self._poss_from_recovery: bool = False  # True if possession came from a recovery event
 
         # --- CONTESTED context ---
         self._pre_contest_team: Optional[str] = None
@@ -100,8 +103,10 @@ class PassDetector:
             return []
 
         if possession.team in _KNOWN_TEAMS and not possession.is_stale:
-            # Fresh possession from dead — clean start, no event
-            self._enter_possessed(possession)
+            # Fresh possession from dead — mark as from_dead so the detector
+            # requires a minimum number of active possession frames before
+            # attributing a kick to this team (prevents glitch-triggered FPs).
+            self._enter_possessed(possession, from_dead=True)
             return []
 
         if possession.team == "loose" and speed >= self.config.ball_velocity_threshold:
@@ -133,19 +138,30 @@ class PassDetector:
             self._loose_frames = 0
             self._poss_player_id = possession.player_track_id
             self._poss_player_role = possession.player_role
+            self._poss_frame_count += 1
             return []
 
         if possession.team == "loose":
             if speed >= self.config.ball_velocity_threshold:
-                # Ball kicked — enter flight, kicker is the possessed team
+                # Ball kicked — enter flight, kicker is the possessed team.
+                # Exception: if this possession was established from a RECOVERY event
+                # and the team has had very few active frames (< min), the ball may
+                # have been picked up via a tracker glitch (e.g. ball teleporting near
+                # a player after a save/scramble).  Treat as unknown kicker (→ recovery,
+                # not emitted) to suppress false positive interceptions.
                 stale = self._loose_frames
                 self._loose_frames = 0
+                post_recovery_glitch = (
+                    self._poss_from_recovery
+                    and self._poss_frame_count
+                    < self.config.min_post_recovery_possession_frames
+                )
                 if stale > self.config.pass_held_loose_max_frames:
                     # Ball has been drifting loose too long — kicker attribution
                     # is unreliable; treat as a dead-ball restart
                     self._enter_dead()
                 else:
-                    self._enter_flight(frame, kicker_known=True)
+                    self._enter_flight(frame, kicker_known=not post_recovery_glitch)
                 return []
 
             self._loose_frames += 1
@@ -260,7 +276,10 @@ class PassDetector:
             return []  # no emittable event
 
         events = self._classify_reception(frame, possession)
-        self._enter_possessed(possession)
+        # If the reception was a recovery (unknown kicker), flag the new possession
+        # so that a very-brief subsequent kick is also treated as unknown.
+        is_recovery = any(e.event_type == "recovery" for e in events)
+        self._enter_possessed(possession, from_recovery=is_recovery)
         return events
 
     # ------------------------------------------------------------------
@@ -363,6 +382,9 @@ class PassDetector:
         self._poss_player_role = None
         self._loose_frames = 0
         self._pre_flight_peak_speed = 0.0
+        self._poss_frame_count = 0
+        self._poss_from_dead = False
+        self._poss_from_recovery = False
         self._pre_contest_team = None
         self._pre_contest_player_id = None
         self._pre_contest_role = None
@@ -377,13 +399,18 @@ class PassDetector:
         self._peak_speed = 0.0
         self._dead_frames = 0
 
-    def _enter_possessed(self, possession: FramePossession) -> None:
+    def _enter_possessed(
+        self, possession: FramePossession, from_dead: bool = False, from_recovery: bool = False
+    ) -> None:
         self._state = BallState.POSSESSED
         self._poss_team = possession.team
         self._poss_player_id = possession.player_track_id
         self._poss_player_role = possession.player_role
         self._loose_frames = 0
         self._pre_flight_peak_speed = 0.0
+        self._poss_frame_count = 0
+        self._poss_from_dead = from_dead
+        self._poss_from_recovery = from_recovery
         self._pre_contest_team = None
         self._pre_contest_player_id = None
         self._pre_contest_role = None

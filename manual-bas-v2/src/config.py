@@ -54,6 +54,11 @@ class Config:
     interception_max_flight_frames: int = 20
     # Max consecutive loose-ball frames while in POSSESSED before resetting to DEAD
     pass_held_loose_max_frames: int = 7
+    # After a "recovery" event, the new possessor may have obtained the ball via a
+    # tracker glitch or brief loose-ball pickup.  Require at least this many
+    # same-team possession frames before attributing a subsequent kick to that team.
+    # Applied ONLY after recovery events (not after pass/interception/dead).
+    min_post_recovery_possession_frames: int = 3
 
     # ------------------------------------------------------------------ #
     # Shot suppressor (internal only — never emitted)                     #

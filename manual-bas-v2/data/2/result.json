@@ -9,14 +9,6 @@
       "action": "pass_received"
     },
     {
-      "frame": 424,
-      "action": "pass"
-    },
-    {
-      "frame": 470,
-      "action": "pass_received"
-    },
-    {
       "frame": 622,
       "action": "pass"
     },
