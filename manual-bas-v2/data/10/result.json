@@ -1,0 +1,28 @@
+{
+  "predictions": [
+    {
+      "frame": 65,
+      "action": "pass"
+    },
+    {
+      "frame": 98,
+      "action": "pass_received"
+    },
+    {
+      "frame": 124,
+      "action": "pass"
+    },
+    {
+      "frame": 155,
+      "action": "pass_received"
+    },
+    {
+      "frame": 554,
+      "action": "pass"
+    },
+    {
+      "frame": 616,
+      "action": "pass_received"
+    }
+  ]
+}

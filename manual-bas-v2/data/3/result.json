@@ -1,0 +1,56 @@
+{
+  "predictions": [
+    {
+      "frame": 91,
+      "action": "pass"
+    },
+    {
+      "frame": 140,
+      "action": "pass_received"
+    },
+    {
+      "frame": 211,
+      "action": "pass"
+    },
+    {
+      "frame": 262,
+      "action": "pass_received"
+    },
+    {
+      "frame": 284,
+      "action": "pass"
+    },
+    {
+      "frame": 305,
+      "action": "pass_received"
+    },
+    {
+      "frame": 310,
+      "action": "pass"
+    },
+    {
+      "frame": 333,
+      "action": "pass_received"
+    },
+    {
+      "frame": 358,
+      "action": "interception"
+    },
+    {
+      "frame": 376,
+      "action": "interception"
+    },
+    {
+      "frame": 512,
+      "action": "pass"
+    },
+    {
+      "frame": 518,
+      "action": "pass_received"
+    },
+    {
+      "frame": 556,
+      "action": "interception"
+    }
+  ]
+}
