@@ -10,9 +10,6 @@ class Config:
     possession_proximity_factor: float = 0.5
     # Consecutive frames required to commit a possession change
     possession_min_frames: int = 3
-    # Minimum model bbox detection_confidence to count a player for possession.
-    # Default 0.0 = ignore (possession uses geometry + team only; scores are noisy).
-    possession_min_detection_confidence: float = 0.0
     # Minimum team-classification confidence (None = skip check)
     min_team_confidence: float = 0.80
     # Frames of committed team's absence before possession becomes stale

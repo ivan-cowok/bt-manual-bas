@@ -115,12 +115,8 @@ class PossessionTracker:
         return [(p, d) for d, p in candidates[:2]]
 
     def _is_eligible(self, player: PlayerDetection) -> bool:
+        # Eligibility is geometry + team only; bbox detection_confidence is ignored.
         if player.team == "unknown":
-            return False
-        if (
-            player.detection_confidence
-            < self.config.possession_min_detection_confidence
-        ):
             return False
         if (
             player.team_confidence is not None
