@@ -4,20 +4,25 @@ import sys
 from src.config import Config
 from src.parser import parse_clip
 from src.pipeline import Pipeline
+from src.postprocessing import relabel_consecutive_interceptions
 
 
-def main(input_path: str, output_path: str | None = None) -> None:
-    config = Config()
+def main(input_path: str, output_path: str | None = None, production: bool = True) -> None:
+    config = Config(is_production=production)
     metadata, frames = parse_clip(input_path)
 
     video_id = metadata.get("video_id", "unknown")
-    print(f"Processing '{video_id}' — {len(frames)} frames at {metadata.get('fps', '?')} fps")
+    mode_tag = "PROD" if production else "DEV"
+    print(f"[{mode_tag}] Processing '{video_id}' — {len(frames)} frames at {metadata.get('fps', '?')} fps")
 
     EMITTED_TYPES = {"pass", "pass_received", "interception"}
 
     pipeline = Pipeline(config)
     all_events = pipeline.run(frames)
     emitted = [e for e in all_events if e.event_type in EMITTED_TYPES]
+
+    if production:
+        relabel_consecutive_interceptions(emitted)
 
     print(f"Detected {len(emitted)} events ({len(all_events) - len(emitted)} internal-only suppressed)")
     for e in emitted:
@@ -43,7 +48,15 @@ def main(input_path: str, output_path: str | None = None) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python main.py <input_json> [output_json]")
+        print("Usage: python main.py <input_json> [output_json] [--dev]")
         sys.exit(1)
 
-    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
+    args = sys.argv[1:]
+    dev_mode = "--dev" in args
+    positional = [a for a in args if not a.startswith("--")]
+
+    main(
+        positional[0],
+        positional[1] if len(positional) > 1 else None,
+        production=not dev_mode,
+    )

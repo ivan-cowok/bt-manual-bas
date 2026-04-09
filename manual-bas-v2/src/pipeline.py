@@ -7,7 +7,11 @@ from .detectors.pass_detector import PassDetector
 from .features.possession import PossessionTracker
 from .features.velocity import BallVelocityCalculator
 from .models import Event, Frame, FramePossession, Vector2D
-from .postprocessing import temporal_nms
+from .postprocessing import (
+    remove_pass_received_before_interception,
+    shift_short_pass_frames,
+    temporal_nms,
+)
 
 
 class Pipeline:
@@ -85,4 +89,8 @@ class Pipeline:
             raw_events.extend(events)
             lookback.append(possession)
 
-        return temporal_nms(raw_events, self.config)
+        events = temporal_nms(raw_events, self.config)
+        if self.config.is_production:
+            events = shift_short_pass_frames(events, self.config)
+            events = remove_pass_received_before_interception(events, self.config)
+        return events
