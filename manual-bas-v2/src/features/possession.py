@@ -80,7 +80,17 @@ class PossessionTracker:
                 timestamp_ms=frame.timestamp_ms,
             )
 
-        return self._apply_smoothing(top2, frame)
+        possession = self._apply_smoothing(top2, frame)
+
+        # Set cross-team ambiguity flag: is the nearest eligible opponent
+        # within margin of the winner?  Computed after smoothing so it never
+        # affects who wins — only adds information for the pass detector.
+        winner, d_winner = top2[0]
+        possession.is_cross_team_ambiguous = self._check_cross_team_ambiguous(
+            frame, winner, d_winner
+        )
+
+        return possession
 
     # ------------------------------------------------------------------
     # Internal
@@ -113,6 +123,30 @@ class PossessionTracker:
 
         candidates.sort(key=lambda x: x[0])
         return [(p, d) for d, p in candidates[:2]]
+
+    def _check_cross_team_ambiguous(
+        self, frame: Frame, winner: PlayerDetection, d_winner: float
+    ) -> bool:
+        """True when the nearest eligible opponent is within margin of the winner.
+
+        Checks ALL eligible opponents (not just within-threshold ones) so it
+        also catches the near-miss case: opponent just outside the threshold
+        but geometrically almost tied with the winner.
+        Only meaningful for outfield players (goalkeepers use bbox distance).
+        """
+        if frame.ball is None or winner.role == "goalkeeper":
+            return False
+        ball_center = frame.ball.center
+        margin_px = self.config.cross_team_ambiguity_margin_norm * winner.bbox_height
+        for player in frame.players:
+            if not self._is_eligible(player):
+                continue
+            if player.team == winner.team:
+                continue
+            d = _euclidean(ball_center, player.feet)
+            if d - d_winner < margin_px:
+                return True
+        return False
 
     def _is_eligible(self, player: PlayerDetection) -> bool:
         # Eligibility is geometry + team only; bbox detection_confidence is ignored.

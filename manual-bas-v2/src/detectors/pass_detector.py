@@ -80,6 +80,9 @@ class PassDetector:
         self._pending_interception_possession: Optional[FramePossession] = None
         self._pending_interception_post_vels: List[Optional[Vector2D]] = []
         self._pending_interception_vel_before: Optional[Vector2D] = None
+        # True when the reception that triggered the pending interception was
+        # cross-team ambiguous — uses a longer confirm window in that case.
+        self._pending_interception_ambiguous: bool = False
 
         # --- DEAD context ---
         self._dead_frames: int = 0           # frames of stationary + no possessor
@@ -463,6 +466,7 @@ class PassDetector:
         self._pending_interception_possession = possession
         self._pending_interception_post_vels = []
         self._pending_interception_vel_before = vel_before
+        self._pending_interception_ambiguous = possession.is_cross_team_ambiguous
 
     def _process_pending_interception(
         self,
@@ -486,10 +490,17 @@ class PassDetector:
             self._enter_possessed(possession, from_recovery=is_recovery)
             return events
 
-        # Wait until we have enough post-contact frames
+        # Wait until we have enough post-contact frames.
+        # When the initial reception was cross-team ambiguous, use the longer
+        # confirm window — gives more time for the true winner to stabilise.
+        confirm_frames = (
+            self.config.cross_team_ambiguity_confirm_frames
+            if self._pending_interception_ambiguous
+            else self.config.interception_confirm_frames
+        )
         if (
             len(self._pending_interception_post_vels)
-            < self.config.interception_confirm_frames
+            < confirm_frames
         ):
             return []
 
@@ -550,6 +561,7 @@ class PassDetector:
         self._pending_interception_possession = None
         self._pending_interception_post_vels = []
         self._pending_interception_vel_before = None
+        self._pending_interception_ambiguous = False
 
     @staticmethod
     def _angle_between(

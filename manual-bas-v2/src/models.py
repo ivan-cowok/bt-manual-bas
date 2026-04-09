@@ -87,6 +87,11 @@ class FramePossession:
     # True when top-2 players are from different teams AND both within threshold
     is_contested: bool = False
 
+    # True when the nearest eligible opponent is within cross_team_ambiguity_margin_norm
+    # of the winner's distance — reception winner is geometrically uncertain.
+    # Only set during outfield reception; never set on same-team close cases.
+    is_cross_team_ambiguous: bool = False
+
     # True when the ball position at this frame is a likely tracking glitch:
     # the ball jumped a huge distance from the previous frame (backward check)
     # AND the ball disappears in the very next frame (forward check).

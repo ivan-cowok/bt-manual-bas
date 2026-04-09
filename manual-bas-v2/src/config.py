@@ -14,6 +14,13 @@ class Config:
     min_team_confidence: float = 0.80
     # Frames of committed team's absence before possession becomes stale
     possession_stale_frames: int = 15
+    # Cross-team ambiguity: if the nearest opponent is within this normalized
+    # margin of the winner (margin / winner_bbox_height), flag the reception as
+    # ambiguous so the interception confirm window is extended.
+    cross_team_ambiguity_margin_norm: float = 0.08
+    # Confirm frames used for interception when reception is cross-team ambiguous
+    # (replaces interception_confirm_frames for those frames only).
+    cross_team_ambiguity_confirm_frames: int = 5
 
     # ------------------------------------------------------------------ #
     # Ball absence                                                         #
