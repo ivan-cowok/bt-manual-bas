@@ -7,7 +7,7 @@ from src.pipeline import Pipeline
 from src.postprocessing import relabel_consecutive_interceptions
 
 
-def main(input_path: str, output_path: str | None = None, production: bool = True) -> None:
+def main(input_path: str, output_path: str | None = None, production: bool = False) -> None:
     config = Config(is_production=production)
     metadata, frames = parse_clip(input_path)
 
@@ -48,15 +48,15 @@ def main(input_path: str, output_path: str | None = None, production: bool = Tru
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python main.py <input_json> [output_json] [--dev]")
+        print("Usage: python main.py <input_json> [output_json] [--prod]")
         sys.exit(1)
 
     args = sys.argv[1:]
-    dev_mode = "--dev" in args
+    prod_mode = "--prod" in args
     positional = [a for a in args if not a.startswith("--")]
 
     main(
         positional[0],
         positional[1] if len(positional) > 1 else None,
-        production=not dev_mode,
+        production=prod_mode,
     )

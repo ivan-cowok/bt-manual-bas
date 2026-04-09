@@ -160,9 +160,9 @@ for vid in videos:
     gt_path     = os.path.join(data_path, "ground_truth.json")
     bl_path     = os.path.join(data_path, "baseline.json")
 
-    # Generate result.json in dev mode (no production post-processing)
+    # Generate result.json (dev mode — no production post-processing)
     subprocess.run(
-        [PYTHON, "main.py", output_path, result_path, "--dev"],
+        [PYTHON, "main.py", output_path, result_path],
         capture_output=True, cwd=os.path.dirname(__file__)
     )
 
