@@ -4,6 +4,14 @@ from dataclasses import dataclass
 @dataclass
 class Config:
     # ------------------------------------------------------------------ #
+    # Mode                                                                 #
+    # ------------------------------------------------------------------ #
+    # True  → production output (all post-processing applied).
+    # False → development/evaluation mode (post-processing skipped so
+    #         scores reflect raw detector performance without tweaks).
+    is_production: bool = True
+
+    # ------------------------------------------------------------------ #
     # Possession                                                           #
     # ------------------------------------------------------------------ #
     # Ball within this factor × player bbox_height of player = in possession
@@ -119,3 +127,17 @@ class Config:
     nms_window_pass_received: int = 15
     nms_window_interception: int = 10
     nms_window_recovery: int = 10
+
+    # ------------------------------------------------------------------ #
+    # Post-processing                                                      #
+    # ------------------------------------------------------------------ #
+    # A pass is "short" (subject to frame backshift) if the next event
+    # falls within this many frames.
+    short_pass_max_gap_frames: int = 20
+    # Frames to shift a short-pass event backward to compensate for
+    # the ~2-frame detection latency on quick exchanges.
+    short_pass_frame_backshift: int = 2
+    # Remove a pass_received if the immediately-following event is an
+    # interception within this many frames AND the two events are for
+    # different teams (near-miss false positive filter).
+    pass_received_before_interception_max_gap: int = 10

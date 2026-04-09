@@ -2,3 +2,4 @@ frames
 *.mp4
 *.pyc
 __pycache__/
+result.json
