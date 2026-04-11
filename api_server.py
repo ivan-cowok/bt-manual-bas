@@ -54,15 +54,19 @@ def health() -> dict:
 @app.get("/infer")
 def infer(video_url: str = Query(..., description="Direct downloadable video URL")) -> dict:
     started_at = time.perf_counter()
+    print(f"[infer] start video_url={video_url}", flush=True)
     video_path: Path | None = None
     try:
         try:
+            print("[infer] downloading video...", flush=True)
             video_path = download_video(video_url)
+            print(f"[infer] download complete path={video_path}", flush=True)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Failed to download video: {exc}") from exc
 
         pipeline = _get_pipeline()
         try:
+            print("[infer] detection started", flush=True)
             detection_output = pipeline.process(
                 source_path=str(video_path),
                 output_json=None,
@@ -75,18 +79,23 @@ def infer(video_url: str = Query(..., description="Direct downloadable video URL
                 track_cmc_method="sparseOptFlow",
                 parallel_gmc=True,
             )
+            print("[infer] detection finished", flush=True)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Detection pipeline failed: {exc}") from exc
 
         try:
+            print("[infer] post-processing started", flush=True)
             result_output = postprocess_main.run_inference(detection_output, production=True)
+            print("[infer] post-processing finished", flush=True)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"Post-processing failed: {exc}") from exc
     finally:
         if video_path is not None:
             delete_video(video_path)
+            print(f"[infer] deleted temp video path={video_path}", flush=True)
 
     elapsed_sec = round(time.perf_counter() - started_at, 3)
+    print(f"[infer] done elapsed={elapsed_sec}s", flush=True)
     return {
         "result": result_output,
         "meta": {
