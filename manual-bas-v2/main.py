@@ -7,9 +7,9 @@ from src.pipeline import Pipeline
 from src.postprocessing import relabel_consecutive_interceptions
 
 
-def main(input_path: str, output_path: str | None = None, production: bool = False) -> None:
+def run_inference(source: str | dict, production: bool = False) -> dict:
     config = Config(is_production=production)
-    metadata, frames = parse_clip(input_path)
+    metadata, frames = parse_clip(source)
 
     video_id = metadata.get("video_id", "unknown")
     mode_tag = "PROD" if production else "DEV"
@@ -31,12 +31,16 @@ def main(input_path: str, output_path: str | None = None, production: bool = Fal
             f"t={e.timestamp_ms:>8}ms  team={e.team}  conf={e.confidence:.2f}"
         )
 
-    output = {
+    return {
         "predictions": [
             {"frame": e.frame_id, "action": e.event_type}
             for e in emitted
         ],
     }
+
+
+def main(input_path: str, output_path: str | None = None, production: bool = False) -> None:
+    output = run_inference(input_path, production=production)
 
     if output_path:
         with open(output_path, "w", encoding="utf-8") as f:

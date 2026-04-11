@@ -1,0 +1,1145 @@
+#!/usr/bin/env python3
+"""
+Soccer Game Analysis - Sequential Stage Pipeline with Multi-Resolution Optimization
+
+Pipeline:
+1. STAGE 1: Object Detection (ALL frames) → Get all player/ball/goalkeeper/referee bboxes
+2. STAGE 2: Feature Extraction (ALL player crops) → Get embeddings
+3. STAGE 3: Clustering (ONCE) → Assign teams
+4. STAGE 4: Tracking (ALL frames) → Assign persistent track IDs
+5. STAGE 5: Keypoint Detection (ALL frames) → Get field lines
+6. STAGE 6: Generate JSON Output
+
+Key Optimizations:
+- Sequential stage processing for better GPU utilization
+- Multi-resolution frame storage (pre-compute once, use many times):
+  * Original (dynamic resolution from video) - for crop extraction & tracking
+  * Detection (640×640) - pre-resized for object detection
+  * Keypoint (960×540) - pre-resized for keypoint detection
+- Independent batch size optimization per stage
+- Reduced GPU memory usage (5x smaller transfers)
+- No redundant resizing operations
+
+This approach is optimal for:
+- Better GPU utilization (larger batches per stage)
+- Faster processing (pre-resized frames)
+- Lower GPU memory usage
+- Multi-GPU support (future)
+"""
+
+import os
+import sys
+import io
+import json
+from collections import Counter
+import cv2
+import numpy as np
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass, field
+from tqdm import tqdm
+
+# Force UTF-8 stdout/stderr so Unicode box-drawing chars print correctly
+# on Windows consoles that default to cp1252.
+if hasattr(sys.stdout, 'buffer'):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'buffer'):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+# Register PyTorch's bundled CUDA DLLs (cudart, cublas, cudnn) as a DLL search
+# directory so onnxruntime-gpu can find them without a separate CUDA Toolkit install.
+try:
+    import torch as _torch
+    _torch_lib = os.path.join(os.path.dirname(_torch.__file__), 'lib')
+    if os.path.isdir(_torch_lib):
+        os.add_dll_directory(_torch_lib)
+except Exception:
+    pass
+
+from utils.device_detector import StandaloneDeviceDetector
+from utils.frame_iterator import FrameIterator
+from utils.batch_accumulator import BatchAccumulator
+from team_assignment.preprocessing import TeamCropPreprocessor, ReIDCropPreprocessor
+from team_assignment.encoder import TeamFeatureEncoder, ReIDFeatureEncoder
+from models.object_detector import ObjectDetector
+from models.keypoint_detector import KeypointDetector
+from visualize_results import SoccerResultVisualizer
+
+
+# ---------------------------------------------------------------------------
+# Detection ↔ Tracker format helpers (module-level, no class dependency)
+# ---------------------------------------------------------------------------
+
+def _dets_to_tracker_format(dets: List[Dict]) -> Dict:
+    """
+    Convert a list of detection dicts (class_id, confidence, bbox=[x,y,w,h])
+    to the format expected by DualTrackerFromDetections:
+      {'boxes': (N,4) xyxy float32, 'confidences': (N,) float32, 'class_ids': (N,) int32}
+    """
+    if not dets:
+        return {
+            'boxes':       np.zeros((0, 4), dtype=np.float32),
+            'confidences': np.zeros(0, dtype=np.float32),
+            'class_ids':   np.zeros(0, dtype=np.int32),
+        }
+    boxes = np.array(
+        [[d['bbox'][0], d['bbox'][1],
+          d['bbox'][0] + d['bbox'][2],
+          d['bbox'][1] + d['bbox'][3]] for d in dets],
+        dtype=np.float32,
+    )
+    confidences = np.array([d.get('confidence', 1.0) for d in dets], dtype=np.float32)
+    class_ids   = np.array([d['class_id'] for d in dets], dtype=np.int32)
+    return {'boxes': boxes, 'confidences': confidences, 'class_ids': class_ids}
+
+
+def _iou_1_to_n(box: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+    """Compute IoU between a single [x1,y1,x2,y2] box and an (N,4) array."""
+    ix1 = np.maximum(box[0], boxes[:, 0])
+    iy1 = np.maximum(box[1], boxes[:, 1])
+    ix2 = np.minimum(box[2], boxes[:, 2])
+    iy2 = np.minimum(box[3], boxes[:, 3])
+    inter = np.maximum(0.0, ix2 - ix1) * np.maximum(0.0, iy2 - iy1)
+    area_box   = (box[2] - box[0]) * (box[3] - box[1])
+    area_boxes = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+    union = area_box + area_boxes - inter
+    return inter / (union + 1e-6)
+
+
+def _assign_track_ids(dets: List[Dict], tracks: List) -> None:
+    """
+    Match STrack objects back to the original detection dicts using IoU and
+    write a 'track_id' field into each matching dict.
+
+    Only considers detections whose class_id matches the track's class_id
+    to prevent cross-class mis-assignments (e.g. a ball track matching a
+    player detection because their boxes happen to overlap).
+    """
+    if not dets or not tracks:
+        return
+    det_boxes = np.array(
+        [[d['bbox'][0], d['bbox'][1],
+          d['bbox'][0] + d['bbox'][2],
+          d['bbox'][1] + d['bbox'][3]] for d in dets],
+        dtype=np.float32,
+    )
+    used: set = set()
+    for track in tracks:
+        track_class = int(track.class_id) if hasattr(track, 'class_id') and track.class_id is not None else -1
+        tlbr = np.array(
+            track.det_tlbr if hasattr(track, 'det_tlbr') else track.tlbr,
+            dtype=np.float32,
+        )
+        ious = _iou_1_to_n(tlbr, det_boxes)
+
+        # Only match detections with the same class as this track
+        for i, d in enumerate(dets):
+            if d['class_id'] != track_class:
+                ious[i] = 0.0
+
+        best_idx = int(np.argmax(ious))
+        if ious[best_idx] > 0.3 and best_idx not in used:
+            dets[best_idx]['track_id'] = track.track_id
+            used.add(best_idx)
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PlayerCropMetadata:
+    """Metadata for a single player detection across all frames."""
+    frame_number: int
+    player_index: int  # Index of player within the frame
+    bbox: List[int]    # [x, y, w, h]
+    embedding: np.ndarray = field(repr=False)
+    team_id: int = -1  # Will be assigned after clustering: 0=Team A, 1=Team B, -1=Unknown
+    team_confidence: float = 0.0
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+
+class SoccerAnalysisPipeline:
+    """
+    Main pipeline for soccer game analysis.
+    Processes video/images through sequential stages.
+    """
+
+    def __init__(
+        self,
+        team_model_path: str = "models/team/team.onnx",
+        reid_model_path: str = "models/team/osnet.onnx",
+        detection_model_path: str = "models/detection/objectdetect.onnx",
+        keypoint_model_path: str = "models/keypoint/keypoint.onnx",
+        line_model_path: str = "models/keypoint/line.onnx",
+        use_gpu: bool = False,
+        detection_batch_size: int = 16,
+        encoder_batch_size: int = 128,
+        keypoint_batch_size: int = 16,
+        encoder_type: str = "autoencoder",  # "autoencoder" | "reid"
+        outlier_sigma: float = -1.0,        # <0 = disabled; >=0 = mark outliers as -1
+        overlay_scale: float = 0.6,         # text/overlay size multiplier for visualization
+    ):
+        """
+        Initialize the analysis pipeline.
+
+        Args:
+            team_model_path:    Path to autoencoder ONNX model (used when encoder_type="autoencoder")
+            reid_model_path:    Path to OSNet ONNX model       (used when encoder_type="reid")
+            detection_model_path: Path to object detection ONNX model
+            keypoint_model_path:  Path to keypoint detection ONNX model
+            line_model_path:      Path to line detection ONNX model
+            use_gpu:            Whether to use GPU (CUDA) if available
+            detection_batch_size: Batch size for object detection
+            encoder_batch_size:   Batch size for feature extraction
+            keypoint_batch_size:  Batch size for keypoint detection
+            encoder_type:       Feature encoder backend:
+                                  "autoencoder" – original team.onnx (64×64, NHWC)
+                                  "reid"        – OSNet osnet.onnx   (256×128, NCHW, ImageNet norm)
+            outlier_sigma:      Distance threshold for outlier detection in clustering.
+                                  Players whose embedding distance to their cluster center
+                                  exceeds (mean + sigma * std) are marked team_id=-1.
+                                  Set to -1 (default) to disable outlier detection.
+        """
+        print()
+        print("="*70)
+        print("SOCCER ANALYSIS PIPELINE - INITIALIZATION")
+        print("="*70)
+        print()
+
+        # Device detection
+        print("1. Detecting hardware...")
+        device_info = StandaloneDeviceDetector.detect_all()
+
+        if use_gpu and device_info.has_gpu:
+            self.providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            print(f"[OK] Using GPU: {device_info.gpu_name}")
+            print(f"  VRAM: {device_info.gpu_memory_total_mb:.0f} MB")
+        else:
+            self.providers = ['CPUExecutionProvider']
+            if use_gpu and not device_info.has_gpu:
+                if not device_info._has_nvidia_gpu:
+                    print("[WARN] --gpu requested but no NVIDIA GPU detected (nvidia-smi not found).")
+                elif not device_info._has_cuda_provider:
+                    print("[WARN] --gpu requested: NVIDIA GPU found but CUDAExecutionProvider is missing.")
+                    print("       You have the CPU-only onnxruntime package.")
+                    print("       Fix:  pip uninstall onnxruntime && pip install onnxruntime-gpu")
+                else:
+                    print("[WARN] --gpu requested but GPU could not be enabled (unknown reason).")
+                print("       Falling back to CPU.")
+            print(f"[OK] Using CPU: {device_info.cpu_name}")
+            print(f"  RAM: {device_info.ram_total_mb:.0f} MB")
+        print()
+
+        # Initialize team assignment components
+        print("2. Loading team assignment model...")
+        if encoder_type == "reid":
+            self.team_preprocessor = ReIDCropPreprocessor()
+            self.team_encoder = ReIDFeatureEncoder(reid_model_path, self.providers)
+            print(f"[OK] ReID encoder loaded: {reid_model_path}")
+        else:
+            self.team_preprocessor = TeamCropPreprocessor()
+            self.team_encoder = TeamFeatureEncoder(team_model_path, self.providers)
+            print(f"[OK] Autoencoder loaded: {team_model_path}")
+        self.encoder_type  = encoder_type
+        self.outlier_sigma = outlier_sigma
+        self.overlay_scale = overlay_scale
+        print()
+
+        # Initialize object detection model
+        print("3. Loading object detection model...")
+        self.object_detector = ObjectDetector(detection_model_path, self.providers)
+        print(f"[OK] Object detector loaded: {detection_model_path}")
+        print()
+
+        # Initialize keypoint detector (dual-model)
+        print("4. Loading field detection models...")
+        self.keypoint_detector = KeypointDetector(
+            keypoint_model_path=keypoint_model_path,
+            line_model_path=line_model_path,
+            providers=self.providers,
+            kp_threshold=0.05,
+            line_threshold=0.05,
+            use_32_keypoints=True
+        )
+        print(f"[OK] Keypoint detector loaded (dual-model system)")
+        print()
+
+        # Store batch sizes for each stage
+        self.detection_batch_size = detection_batch_size
+        self.encoder_batch_size   = encoder_batch_size
+        self.keypoint_batch_size  = keypoint_batch_size
+
+        print(f"5. Batch sizes (optimized per stage):")
+        enc_input = "256×128×3 (NCHW)" if encoder_type == "reid" else "64×64×3 (NHWC)"
+        print(f"   - Object Detection:    {detection_batch_size} (input: 640×640×3)")
+        print(f"   - Feature Extraction:  {encoder_batch_size} (input: {enc_input})")
+        print(f"   - Keypoint Detection:  {keypoint_batch_size} (input: 960×544×3)")
+        print()
+
+        print(f"6. Frame storage strategy:")
+        print(f"   Pre-compute and store 3 resolutions per frame:")
+        print(f"   - Original: Dynamic (from video) - for crop extraction & tracking")
+        print(f"   - Detection: 640×640 - pre-resized for GPU")
+        print(f"   - Keypoint: 960×540 - pre-resized for GPU")
+        print(f"   (Actual memory usage displayed after loading frames)")
+        print()
+
+        # Pipeline data storage
+        self.frames_original: List[np.ndarray] = []
+        self.frames_detection: List[np.ndarray] = []
+        self.frames_keypoint: List[np.ndarray] = []
+        self.frame_numbers: List[int] = []
+        self.frame_detections: Dict[int, List[Dict]] = {}
+        self.frame_keypoints: Dict[int, List[float]] = {}
+        self.all_player_metadata: List[PlayerCropMetadata] = []
+        self.gmc_matrices: Optional[np.ndarray] = None   # (N,2,3) from Stage 4
+        self.reid_lookup: Dict[Tuple[int, int], np.ndarray] = {}  # (frame_num, det_idx) → embedding
+        self.gk_team_assignments: Dict[int, str] = {}             # track_id → 'left'|'right'|''
+
+        # Video properties (set during Stage 1)
+        self.original_width:  int   = 0
+        self.original_height: int   = 0
+        self.fps:             float = 25.0
+
+        self.detection_input_size = (640, 640)
+        self.keypoint_input_size  = (960, 540)
+
+        print("="*70)
+        print("[OK] INITIALIZATION COMPLETE")
+        print("="*70)
+        print()
+
+    def process(
+        self,
+        source_path: str,
+        output_json: str = "output.json",
+        visualize: bool = False,
+        output_video: str = None,
+        display: bool = True,
+        skip_keypoints: bool = False,
+        skip_tracking: bool = False,
+        track_cmc: bool = True,
+        track_cmc_method: str = 'sparseOptFlow',
+        parallel_gmc: bool = False,
+        num_gmc_workers: Optional[int] = None,
+    ):
+        """
+        Run complete SEQUENTIAL STAGE analysis.
+
+        Pipeline:
+        1. STAGE 1: Object Detection (ALL frames) → player/ball/goalkeeper/referee bboxes
+        2. STAGE 2: Feature Extraction (ALL player crops) → embeddings
+        3. STAGE 3: Clustering (ONCE) → team assignments
+        4. STAGE 4: Tracking (ALL frames) → persistent track IDs (optional)
+        5. STAGE 5: Keypoint Detection (ALL frames) → field lines (optional)
+        6. STAGE 6: Generate JSON Output
+        7. STAGE 7 (Optional): Visualize Results
+
+        Args:
+            source_path:      Video file or image folder
+            output_json:      Output JSON path
+            visualize:        Whether to run visualization after analysis
+            output_video:     Output video path (required if visualize=True and display=False)
+            display:          Whether to display video in real-time (if visualize=True)
+            skip_keypoints:   Whether to skip keypoint detection (default: False)
+            skip_tracking:    Whether to skip tracking stage (default: False)
+            track_cmc:        Enable camera motion compensation in tracker (default: True)
+            track_cmc_method: GMC method for tracker, e.g. 'sparseOptFlow' (default)
+            parallel_gmc:     Use parallel multiprocessing for GMC pre-computation (default: False)
+            num_gmc_workers:  Worker count for parallel GMC (default: cpu_count())
+        """
+        print(f"Processing: {source_path}")
+        print()
+
+        # STAGE 1: Object Detection for ALL frames
+        self._stage1_object_detection(source_path)
+
+        # STAGE 2: Feature Extraction for ALL player crops
+        self._stage2_feature_extraction()
+
+        # STAGE 3: Clustering and team assignment
+        self._stage3_clustering()
+
+        # STAGE 4: Tracking (optional)
+        if not skip_tracking:
+            self._stage4_tracking(
+                use_cmc=track_cmc,
+                cmc_method=track_cmc_method,
+                parallel_gmc=parallel_gmc,
+                num_gmc_workers=num_gmc_workers,
+            )
+        else:
+            print("="*70)
+            print("STAGE 4: TRACKING (SKIPPED)")
+            print("="*70)
+            print()
+            print("Tracking skipped (--no-track flag enabled)")
+            print()
+
+        # STAGE 4b: Goalkeeper team assignment (needs track IDs from Stage 4)
+        self._assign_goalkeeper_teams()
+
+        # STAGE 5: Keypoint Detection for ALL frames (optional)
+        if not skip_keypoints:
+            self._stage5_keypoint_detection()
+        else:
+            print("="*70)
+            print("STAGE 5: KEYPOINT DETECTION (SKIPPED)")
+            print("="*70)
+            print()
+            print("Keypoint detection skipped (--skip-keypoints flag enabled)")
+            print()
+
+        # STAGE 6: Generate JSON output
+        self._stage6_generate_output(output_json)
+
+        # STAGE 7 (Optional): Visualize results
+        if visualize:
+            self._stage7_visualize(source_path, output_json, output_video, display)
+
+        print()
+        print("="*70)
+        print("[OK] PROCESSING COMPLETE")
+        print("="*70)
+
+    # =========================================================================
+    # STAGE 1: OBJECT DETECTION (ALL FRAMES)
+    # =========================================================================
+
+    def _stage1_object_detection(self, source_path: str):
+        """STAGE 1: Object Detection for ALL frames."""
+        print("="*70)
+        print("STAGE 1: OBJECT DETECTION (ALL FRAMES)")
+        print("="*70)
+        print()
+
+        frame_iterator = FrameIterator(source_path)
+        props = frame_iterator.get_properties()
+
+        self.original_width  = props['width']
+        self.original_height = props['height']
+        self.fps             = props.get('fps', 25.0)
+
+        print(f"Source: {source_path}")
+        print(f"Type: {props['source_type']}")
+        print(f"Frames: {props['total_frames']}")
+        print(f"FPS: {self.fps:.2f}")
+        print(f"Original resolution: {self.original_width}×{self.original_height}")
+        print(f"Detection resolution: {self.detection_input_size[0]}×{self.detection_input_size[1]}")
+        print(f"Keypoint resolution: {self.keypoint_input_size[0]}×{self.keypoint_input_size[1]}")
+        print(f"Batch size: {self.detection_batch_size}")
+        print()
+
+        accumulator = BatchAccumulator(batch_size=self.detection_batch_size)
+        pbar = tqdm(total=props['total_frames'], desc="Detecting objects")
+
+        try:
+            for frame, frame_number in frame_iterator:
+                self.frames_original.append(frame.copy())
+                frame_detection = cv2.resize(frame, self.detection_input_size)
+                self.frames_detection.append(frame_detection)
+                frame_keypoint = cv2.resize(frame, self.keypoint_input_size)
+                self.frames_keypoint.append(frame_keypoint)
+                self.frame_numbers.append(frame_number)
+
+                is_ready = accumulator.add_frame(frame_detection, frame_number)
+                if is_ready:
+                    batch_frames, batch_numbers = accumulator.get_batch()
+                    self._detect_objects_batch(batch_frames, batch_numbers)
+                    pbar.update(len(batch_numbers))
+
+            if not accumulator.is_empty():
+                batch_frames, batch_numbers = accumulator.get_batch()
+                self._detect_objects_batch(batch_frames, batch_numbers)
+                pbar.update(len(batch_numbers))
+
+        finally:
+            pbar.close()
+            frame_iterator.close()
+
+        total_detections = sum(len(d) for d in self.frame_detections.values())
+        print()
+        print(f"[OK] Detected {total_detections} objects in {len(self.frame_detections)} frames")
+        self._print_memory_usage()
+        print()
+
+    def _detect_objects_batch(self, frames_batch: np.ndarray, frame_numbers: List[int]):
+        detections_batch = self.object_detector.detect_batch(
+            frames_batch,
+            original_size=(self.original_width, self.original_height)
+        )
+        for frame_num, detections in zip(frame_numbers, detections_batch):
+            self.frame_detections[frame_num] = detections
+
+    # =========================================================================
+    # STAGE 2: FEATURE EXTRACTION (ALL PLAYER CROPS)
+    # =========================================================================
+
+    def _stage2_feature_extraction(self):
+        """STAGE 2: Feature Extraction for ALL people crops (GK + players + referees).
+
+        One encoding pass for class 1 (GK), 2 (player), 3 (referee):
+          - All people  → self.reid_lookup[(frame_num, det_idx)] for tracking ReID
+          - Players only → self.all_player_metadata (unchanged) for team clustering
+        """
+        print("="*70)
+        print("STAGE 2: FEATURE EXTRACTION (ALL PLAYER CROPS)")
+        print("="*70)
+        print()
+
+        all_people_crops: List = []
+        all_people_meta:  List = []   # list of dicts per crop
+
+        print("Collecting people crops from all frames...")
+        print("(Ball excluded; GK, players, and referees all encoded for ReID)")
+        for frame_num, frame in zip(self.frame_numbers, self.frames_original):
+            if frame_num not in self.frame_detections:
+                continue
+            detections = self.frame_detections[frame_num]
+
+            # Collect (full_det_idx, det) for all people classes in this frame
+            people = [(full_idx, det)
+                      for full_idx, det in enumerate(detections)
+                      if det['class_id'] in [1, 2, 3]]
+            if not people:
+                continue
+
+            bboxes_xyxy = [
+                [det['bbox'][0], det['bbox'][1],
+                 det['bbox'][0] + det['bbox'][2],
+                 det['bbox'][1] + det['bbox'][3]]
+                for _, det in people
+            ]
+
+            crops, valid_indices = self.team_preprocessor.preprocess_batch(
+                frame, bboxes_xyxy
+            )
+
+            # player_idx counts class-2 detections per frame for backward compatibility
+            # with all_player_metadata (used by Stage 3 clustering and Stage 6 JSON)
+            player_idx = 0
+            for crop, valid_idx in zip(crops, valid_indices):
+                full_det_idx, det = people[valid_idx]
+                class_id = det['class_id']
+
+                all_people_crops.append(crop)
+                all_people_meta.append({
+                    'frame_number': frame_num,
+                    'full_det_idx': full_det_idx,   # index in full det list → reid_lookup key
+                    'class_id':     class_id,
+                    'player_index': player_idx if class_id == 2 else -1,
+                    'bbox':         det['bbox'],
+                })
+                if class_id == 2:
+                    player_idx += 1
+
+        n_people  = len(all_people_crops)
+        n_players = sum(1 for m in all_people_meta if m['class_id'] == 2)
+        print(f"[OK] Collected {n_people} people crops "
+              f"({n_players} players, {n_people - n_players} GK/REF)")
+        print()
+
+        if not all_people_crops:
+            print("[WARN] No people detected. Skipping feature extraction.")
+            return
+
+        print(f"Extracting features in batches (batch_size={self.encoder_batch_size})...")
+        all_embeddings = []
+
+        pbar = tqdm(total=n_people, desc="Encoding crops")
+        for i in range(0, n_people, self.encoder_batch_size):
+            batch_crops      = all_people_crops[i:i + self.encoder_batch_size]
+            crops_normalized = self.team_preprocessor.normalize_for_inference(batch_crops)
+            embeddings       = self.team_encoder.encode_batch(crops_normalized)
+            all_embeddings.extend(embeddings)
+            pbar.update(len(batch_crops))
+        pbar.close()
+
+        for meta, emb in zip(all_people_meta, all_embeddings):
+            # All people → reid_lookup for Stage 4 tracking
+            self.reid_lookup[(meta['frame_number'], meta['full_det_idx'])] = emb
+
+            # Class-2 players only → all_player_metadata for Stage 3 clustering
+            if meta['class_id'] == 2:
+                self.all_player_metadata.append(PlayerCropMetadata(
+                    frame_number=meta['frame_number'],
+                    player_index=meta['player_index'],
+                    bbox=meta['bbox'],
+                    embedding=emb,
+                ))
+
+        print()
+        print(f"[OK] Extracted features from {n_people} people crops "
+              f"({len(self.all_player_metadata)} players for team clustering)")
+        print()
+
+    # =========================================================================
+    # STAGE 3: CLUSTERING (ONCE)
+    # =========================================================================
+
+    def _stage3_clustering(self):
+        """STAGE 3: Clustering and team assignment (ONCE on all embeddings)."""
+        print("="*70)
+        print("STAGE 3: CLUSTERING & TEAM ASSIGNMENT")
+        print("="*70)
+        print()
+
+        if not self.all_player_metadata:
+            print("[WARN] No player data to cluster. Skipping team assignment.")
+            return
+
+        all_embeddings = np.array([meta.embedding for meta in self.all_player_metadata])
+        print(f"Clustering {len(all_embeddings)} player embeddings...")
+
+        from team_assignment.clustering import TeamClusterer
+        from team_assignment.spatial_assignment import SpatialTeamAssigner
+
+        team_clusterer = TeamClusterer(n_clusters=2, random_state=0)
+        team_clusterer.fit(all_embeddings)
+
+        if self.outlier_sigma >= 0:
+            cluster_assignments = team_clusterer.predict_with_outliers(
+                all_embeddings, sigma=self.outlier_sigma
+            )
+            print(f"[OK] Clustering complete (outlier_sigma={self.outlier_sigma})")
+        else:
+            cluster_assignments = team_clusterer.predict(all_embeddings)
+            print(f"[OK] Clustering complete (outlier detection disabled)")
+        print()
+
+        print("Assigning teams spatially (left=0, right=1)...")
+
+        all_bboxes_xywh = [meta.bbox for meta in self.all_player_metadata]
+        all_bboxes_xyxy = [
+            [x, y, x + w, y + h]
+            for x, y, w, h in all_bboxes_xywh
+        ]
+
+        non_outlier_mask      = cluster_assignments != -1
+        cluster_ids_for_fit   = cluster_assignments[non_outlier_mask]
+        bboxes_for_fit        = [b for b, ok in zip(all_bboxes_xyxy, non_outlier_mask) if ok]
+        cluster_sizes_for_fit = dict(Counter(cluster_ids_for_fit.tolist()))
+
+        spatial_assigner = SpatialTeamAssigner(exclude_smallest_cluster=True)
+        spatial_assigner.fit(cluster_ids_for_fit, bboxes_for_fit, cluster_sizes_for_fit)
+
+        team_assignments = spatial_assigner.predict(cluster_assignments)
+
+        for meta, team_id in zip(self.all_player_metadata, team_assignments):
+            meta.team_id         = int(team_id)
+            meta.team_confidence = 0.95  # placeholder
+
+        team_counts: Dict[int, int] = {}
+        for meta in self.all_player_metadata:
+            team_counts[meta.team_id] = team_counts.get(meta.team_id, 0) + 1
+
+        print()
+        print("Team Distribution:")
+        for team_id, count in sorted(team_counts.items()):
+            label = "left" if team_id == 0 else "right" if team_id == 1 else "Unknown"
+            print(f"  {label} (ID={team_id}): {count} players")
+        print()
+
+    # =========================================================================
+    # STAGE 4: TRACKING (ALL FRAMES)
+    # =========================================================================
+
+    def _stage4_tracking(
+        self,
+        use_cmc: bool = True,
+        cmc_method: str = 'sparseOptFlow',
+        parallel_gmc: bool = False,
+        num_gmc_workers: Optional[int] = None,
+    ):
+        """
+        STAGE 4: Multi-object tracking for ALL frames.
+
+        Uses DualTrackerFromDetections (BoT-SORT with distance-based ball matching
+        and class-specific people matching).  Assigns a persistent 'track_id' to
+        each detection dict in self.frame_detections.
+
+        GMC is pre-computed in a separate pass over all frames before the
+        tracking loop starts, so the tracker does only a cheap matrix lookup
+        per frame.  Sequential pre-computation uses detection masking
+        (player/ball regions excluded from optical flow).  Parallel mode runs
+        feature extraction and homography estimation across all CPU cores.
+        """
+        print("="*70)
+        print("STAGE 4: TRACKING (ALL FRAMES)")
+        print("="*70)
+        print()
+        if use_cmc:
+            mode = "parallel" if parallel_gmc else "sequential (detection-masked)"
+            print(f"CMC: enabled ({cmc_method}, pre-computed, {mode})")
+        else:
+            print("CMC: disabled")
+        print()
+
+        from tracking.dual_tracker import DualTrackerFromDetections
+
+        tracker = DualTrackerFromDetections(
+            frame_rate=max(1, int(round(self.fps))),
+            use_cmc=use_cmc,
+            cmc_method=cmc_method,
+            input_width=self.original_width,
+            input_height=self.original_height,
+            verbose=False,
+        )
+
+        # ── Pre-compute GMC matrices (one pass, before the tracking loop) ────
+        if use_cmc and cmc_method != 'none':
+            print("Pre-computing GMC matrices …")
+            from tracking.gmc_precompute import precompute_gmc
+            gmc_matrices = precompute_gmc(
+                frames=self.frames_original,
+                frame_numbers=self.frame_numbers,
+                frame_detections=self.frame_detections,
+                method=cmc_method,
+                downscale=2,
+                parallel=parallel_gmc,
+                num_workers=num_gmc_workers,
+            )
+            tracker.inject_gmc_matrices(gmc_matrices)
+            print(f"[OK] GMC matrices injected ({len(gmc_matrices)} frames)")
+            self.gmc_matrices = gmc_matrices   # kept for JSON output (transform field)
+            print()
+
+        pbar = tqdm(total=len(self.frame_numbers), desc="Tracking")
+        try:
+            for frame_idx, frame_num in enumerate(self.frame_numbers):
+                frame = self.frames_original[frame_idx]
+                dets  = self.frame_detections.get(frame_num, [])
+
+                # Build per-detection ReID embedding list (None for ball / missing crops)
+                reid_embs = [self.reid_lookup.get((frame_num, det_idx))
+                             for det_idx in range(len(dets))]
+
+                tracker_input = _dets_to_tracker_format(dets)
+                _, ball_tracks, people_tracks = tracker.process_frame_with_detections(
+                    frame, tracker_input, reid_embeddings=reid_embs
+                )
+
+                _assign_track_ids(dets, ball_tracks + people_tracks)
+                pbar.update(1)
+        finally:
+            pbar.close()
+
+        # Summarise unique tracks
+        unique_tracks: set = set()
+        for dets in self.frame_detections.values():
+            for d in dets:
+                if 'track_id' in d:
+                    unique_tracks.add((d['class_id'], d['track_id']))
+
+        print()
+        print(f"[OK] Tracking complete. {len(unique_tracks)} unique tracks "
+              f"across {len(self.frame_numbers)} frames")
+        print()
+
+    # =========================================================================
+    # STAGE 4b: GOALKEEPER TEAM ASSIGNMENT
+    # =========================================================================
+
+    def _assign_goalkeeper_teams(self):
+        """
+        Assign each goalkeeper track to 'left' or 'right' team using x-position only.
+
+        Goalkeepers almost never cross the halfway line, so the median x-center
+        of all detections belonging to a track is a reliable indicator:
+          median_x < field_center  →  'left'
+          median_x ≥ field_center  →  'right'
+
+        The result is stored in self.gk_team_assignments[track_id].
+        """
+        print("="*70)
+        print("STAGE 4b: GOALKEEPER TEAM ASSIGNMENT")
+        print("="*70)
+        print()
+
+        field_center_x = self.original_width / 2.0
+
+        # ── Collect per-track x-centers ───────────────────────────────────────
+        # gk_tracks[track_id] = [x_center, ...]
+        gk_tracks: Dict[int, List[float]] = {}
+
+        for dets in self.frame_detections.values():
+            for det in dets:
+                if det.get('class_id') != 1:
+                    continue
+                tid = det.get('track_id', -1)
+                if tid < 0:
+                    continue
+                x, y, w, h = det['bbox']
+                x_center = x + w / 2.0
+                gk_tracks.setdefault(tid, []).append(x_center)
+
+        if not gk_tracks:
+            print("[INFO] No goalkeeper tracks found. Skipping.")
+            print()
+            return
+
+        # ── Assign each GK track by median x ──────────────────────────────────
+        for tid, x_centers in sorted(gk_tracks.items()):
+            median_x = float(np.median(x_centers))
+            team = 'left' if median_x < field_center_x else 'right'
+            self.gk_team_assignments[tid] = team
+
+            print(f"  GK track_id={tid:3d} | "
+                  f"detections={len(x_centers):4d} | "
+                  f"median_x={median_x:6.0f} | "
+                  f"field_center={field_center_x:.0f} → {team.upper()}")
+
+        print()
+        print(f"[OK] Assigned {len(self.gk_team_assignments)} goalkeeper track(s) to teams")
+        print()
+
+    # =========================================================================
+    # STAGE 5: KEYPOINT DETECTION (ALL FRAMES)
+    # =========================================================================
+
+    def _stage5_keypoint_detection(self):
+        """STAGE 5: Keypoint Detection for ALL frames."""
+        print("="*70)
+        print("STAGE 5: KEYPOINT DETECTION (ALL FRAMES)")
+        print("="*70)
+        print()
+        print(f"Batch size: {self.keypoint_batch_size}")
+        print()
+
+        accumulator = BatchAccumulator(batch_size=self.keypoint_batch_size)
+        pbar = tqdm(total=len(self.frames_keypoint), desc="Detecting keypoints")
+
+        for frame, frame_num in zip(self.frames_keypoint, self.frame_numbers):
+            is_ready = accumulator.add_frame(frame, frame_num)
+            if is_ready:
+                batch_frames, batch_numbers = accumulator.get_batch()
+                self._detect_keypoints_batch(batch_frames, batch_numbers)
+                pbar.update(len(batch_numbers))
+
+        if not accumulator.is_empty():
+            batch_frames, batch_numbers = accumulator.get_batch()
+            self._detect_keypoints_batch(batch_frames, batch_numbers)
+            pbar.update(len(batch_numbers))
+
+        pbar.close()
+        print()
+        print(f"[OK] Detected keypoints in {len(self.frame_keypoints)} frames")
+        print()
+
+    def _detect_keypoints_batch(self, frames_batch: np.ndarray, frame_numbers: List[int]):
+        keypoints_batch = self.keypoint_detector.detect_batch(
+            frames_batch,
+            original_width=self.original_width,
+            original_height=self.original_height
+        )
+        for i, frame_num in enumerate(frame_numbers):
+            self.frame_keypoints[frame_num] = keypoints_batch[i]
+
+    # =========================================================================
+    # STAGE 6: GENERATE JSON OUTPUT
+    # =========================================================================
+
+    def _stage6_generate_output(self, output_json: str):
+        """STAGE 6: Generate JSON output with all results."""
+        print("="*70)
+        print("STAGE 6: GENERATE JSON OUTPUT")
+        print("="*70)
+        print()
+
+        class_names = {0: "ball", 1: "goalkeeper", 2: "player", 3: "referee"}
+
+        # Build player-team lookup: (frame_num, player_idx) → team info
+        player_team_map: Dict[Tuple[int, int], Dict] = {}
+        for meta in self.all_player_metadata:
+            key = (meta.frame_number, meta.player_index)
+            player_team_map[key] = {
+                'team_id':   meta.team_id,
+                'team_name': ('left'  if meta.team_id == 0
+                              else 'right' if meta.team_id == 1
+                              else ''),
+            }
+
+        output = {
+            'challenge_id':     'soccer-001',
+            'fps':              round(self.fps, 6),
+            'video_resolution': [self.original_width, self.original_height],
+            'frames':           []
+        }
+
+        # Build a position-index lookup so we can retrieve gmc_matrices[i] by frame_num
+        gmc_by_frame: Dict[int, np.ndarray] = {}
+        if self.gmc_matrices is not None:
+            for idx, fn in enumerate(self.frame_numbers):
+                gmc_by_frame[fn] = self.gmc_matrices[idx]
+
+        for frame_num in sorted(self.frame_numbers):
+            # 2×3 affine warp for this frame (camera-motion compensation matrix).
+            # Identity when GMC was not run.
+            if frame_num in gmc_by_frame:
+                mat = gmc_by_frame[frame_num]
+                frame_transform = [[round(float(v), 4) for v in row] for row in mat]
+            else:
+                frame_transform = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+
+            frame_data = {
+                'frame_number': frame_num,
+                'keypoints':    self.frame_keypoints.get(frame_num, []),
+                'transform':    frame_transform,
+                'objects':      []
+            }
+
+            if frame_num in self.frame_detections:
+                player_idx = 0
+                for det_idx, det in enumerate(self.frame_detections[frame_num]):
+                    class_id   = det['class_id']
+                    role       = class_names.get(class_id, "unknown")
+
+                    x, y, w, h = det['bbox']
+                    bbox_xyxy  = [x, y, x + w, y + h]
+
+                    det_entry = {
+                        'bbox':                 bbox_xyxy,
+                        'role':                 role,
+                        'detection_id':         det_idx,
+                        'track_id':             det.get('track_id', -1),
+                        'detection_confidence': round(float(det.get('confidence', 0.0)), 4),
+                    }
+
+                    if class_id == 2:
+                        key = (frame_num, player_idx)
+                        if key in player_team_map:
+                            ti = player_team_map[key]
+                            det_entry['team_name']       = ti['team_name']
+                            det_entry['team_confidence'] = 0.9
+                        else:
+                            det_entry['team_name']       = ''
+                            det_entry['team_confidence'] = 0.0
+                        player_idx += 1
+                    elif class_id == 1:
+                        # Goalkeeper: assigned by _assign_goalkeeper_teams() (Stage 4b)
+                        tid = det.get('track_id', -1)
+                        gk_team = self.gk_team_assignments.get(tid, '')
+                        det_entry['team_name']       = gk_team
+                        det_entry['team_confidence'] = 0.85 if gk_team else 0.0
+                    else:
+                        det_entry['team_name']       = ''
+                        det_entry['team_confidence'] = 0.0
+
+                    frame_data['objects'].append(det_entry)
+
+            output['frames'].append(frame_data)
+
+        print(f"Writing output to: {output_json}")
+        with open(output_json, 'w') as f:
+            json.dump(output, f, indent=2)
+
+        print()
+        print(f"[OK] JSON output generated: {output_json}")
+        print(f"  Challenge ID: {output['challenge_id']}")
+        print(f"  Total frames: {len(output['frames'])}")
+        print(f"  Total objects: {sum(len(f['objects']) for f in output['frames'])}")
+        print()
+
+    # =========================================================================
+    # STAGE 7: VISUALIZATION (OPTIONAL)
+    # =========================================================================
+
+    def _stage7_visualize(
+        self,
+        source_path: str,
+        json_path: str,
+        output_video: str,
+        display: bool
+    ):
+        """STAGE 7: Visualize results (optional)."""
+        print("="*70)
+        print("STAGE 7: VISUALIZATION (OPTIONAL)")
+        print("="*70)
+        print()
+
+        visualizer = SoccerResultVisualizer(
+            video_path=source_path,
+            json_path=json_path,
+            output_path=output_video,
+            display=display,
+            overlay_scale=self.overlay_scale,
+        )
+        visualizer.visualize()
+        print()
+
+    # =========================================================================
+    # UTILITY METHODS
+    # =========================================================================
+
+    def _print_memory_usage(self):
+        """Print memory usage statistics for stored frames."""
+        if not self.frames_original:
+            return
+        n = len(self.frames_original)
+        mo = sum(f.nbytes for f in self.frames_original) / (1024**3)
+        md = sum(f.nbytes for f in self.frames_detection) / (1024**3)
+        mk = sum(f.nbytes for f in self.frames_keypoint) / (1024**3)
+        mt = mo + md + mk
+        print()
+        print("Memory Usage (CPU RAM):")
+        print(f"  Original frames ({self.original_width}×{self.original_height}):  {mo:.2f} GB ({n} frames)")
+        print(f"  Detection frames (640×640):   {md:.2f} GB (pre-resized)")
+        print(f"  Keypoint frames (960×540):    {mk:.2f} GB (pre-resized)")
+        print(f"  ─────────────────────────────────────────")
+        print(f"  Total CPU RAM:                {mt:.2f} GB")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    """Command-line entry point for the pipeline."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='Soccer Game Analysis - Sequential Stage Pipeline'
+    )
+
+    # I/O
+    parser.add_argument('--source', type=str, default='D:/Data/9.mp4',
+                        help='Video file or image folder')
+    parser.add_argument('--output', type=str, default='output/output.json',
+                        help='Output JSON file')
+
+    # Hardware
+    parser.add_argument('--gpu', action='store_false',
+                        help='Use GPU (CUDA) if available')
+
+    # Batch sizes
+    parser.add_argument('--detection-batch-size', type=int, default=16,
+                        help='Batch size for object detection (default: 16)')
+    parser.add_argument('--encoder-batch-size', type=int, default=128,
+                        help='Batch size for feature extraction (default: 128)')
+    parser.add_argument('--keypoint-batch-size', type=int, default=1,
+                        help='Batch size for keypoint detection (default: 1)')
+
+    # Team encoder
+    parser.add_argument('--encoder-type', type=str, default='reid',
+                        choices=['autoencoder', 'reid'],
+                        help='Feature encoder backend for team assignment '
+                             '(autoencoder=team.onnx, reid=osnet.onnx)')
+    parser.add_argument('--reid-model', type=str, default='models/team/osnet.onnx',
+                        help='Path to OSNet ONNX model (used when --encoder-type reid)')
+    parser.add_argument('--outlier-sigma', type=float, default=-1,
+                        help='Outlier sigma for clustering (-1 = disabled, default: 3.0)')
+
+    # Tracking
+    parser.add_argument('--no-track', action='store_true',
+                        help='Skip tracking stage (no track_id in output)')
+    parser.add_argument('--track-cmc-method', type=str, default='sparseOptFlow',
+                        choices=['sparseOptFlow', 'orb', 'ecc', 'none'],
+                        help='Camera motion compensation method for tracker (default: sparseOptFlow)')
+    parser.add_argument('--parallel-gmc', action='store_false',
+                        help='Use parallel multiprocessing for GMC pre-computation '
+                             '(faster on multi-core CPUs, uses all cores by default)')
+    parser.add_argument('--num-gmc-workers', type=int, default=None,
+                        help='Number of worker processes for parallel GMC '
+                             '(default: cpu_count(), only used with --parallel-gmc)')
+
+    # Keypoints
+    parser.add_argument('--skip-keypoints', action='store_false',
+                        help='Skip keypoint detection (faster processing)')
+
+    # Visualization
+    parser.add_argument('--visualize', action='store_true',
+                        help='Create annotated video after analysis')
+    parser.add_argument('--output-video', type=str, default='output/out.mp4',
+                        help='Output video path (for --visualize)')
+    parser.add_argument('--no-display', action='store_true',
+                        help='Do not display video (only save, for --visualize)')
+    parser.add_argument('--overlay-scale', type=float, default=0.1,
+                        help='Scale for on-screen text/overlays (default: 0.1)')
+
+    args = parser.parse_args()
+
+    pipeline = SoccerAnalysisPipeline(
+        use_gpu=args.gpu,
+        detection_batch_size=args.detection_batch_size,
+        encoder_batch_size=args.encoder_batch_size,
+        keypoint_batch_size=args.keypoint_batch_size,
+        encoder_type=args.encoder_type,
+        reid_model_path=args.reid_model,
+        outlier_sigma=args.outlier_sigma,
+        overlay_scale=args.overlay_scale,
+    )
+
+    pipeline.process(
+        args.source,
+        args.output,
+        visualize=args.visualize,
+        output_video=args.output_video,
+        display=not args.no_display,
+        skip_keypoints=args.skip_keypoints,
+        skip_tracking=args.no_track,
+        track_cmc=(args.track_cmc_method != 'none'),
+        track_cmc_method=args.track_cmc_method,
+        parallel_gmc=args.parallel_gmc,
+        num_gmc_workers=args.num_gmc_workers,
+    )
+
+
+def extract_frames(
+    video_path: str = 'output/out.mp4',
+    output_dir: str = 'output/frames',
+) -> None:
+    """
+    Extract every frame from a video and save as PNG files named by frame number.
+
+    Usage (append to the end of analyze_soccer.py and call separately):
+        python analyze_soccer.py --extract-frames
+        python analyze_soccer.py --extract-frames --output-video output/out.mp4 --frames-dir output/frames
+
+    Files are saved as:  <output_dir>/<frame_number>.png
+    e.g.  output/frames/0.png, output/frames/1.png, ...
+    """
+    import cv2, os
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"[ERROR] Cannot open video: {video_path}")
+        return
+
+    total   = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps     = cap.get(cv2.CAP_PROP_FPS)
+    w       = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h       = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Extracting frames from: {video_path}")
+    print(f"  Resolution: {w}×{h},  FPS: {fps:.2f},  Frames: {total}")
+    print(f"  Output dir: {output_dir}")
+
+    frame_num = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        out_path = os.path.join(output_dir, f"{frame_num}.png")
+        cv2.imwrite(out_path, frame)
+        frame_num += 1
+
+    cap.release()
+    print(f"[OK] Saved {frame_num} frames → {output_dir}/")
+
+
+if __name__ == '__main__':
+    import sys
+    if '--extract-frames' in sys.argv:
+        # Minimal arg parsing for frame extraction mode
+        import argparse as _ap
+        _p = _ap.ArgumentParser(add_help=False)
+        _p.add_argument('--output-video', default='output/out.mp4')
+        _p.add_argument('--frames-dir',   default='output/frames')
+        _a, _ = _p.parse_known_args()
+        extract_frames(_a.output_video, _a.frames_dir)
+    else:
+        main()
