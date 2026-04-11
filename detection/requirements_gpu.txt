@@ -18,6 +18,8 @@ Pillow>=8.0.0
 # Utilities
 tqdm>=4.62.0
 shapely>=1.8.0
+psutil>=5.9.0
+scikit-learn>=1.1.0
 
 # FastReID (optional, for REID features)
 # Install from source: git clone https://github.com/JDAI-CV/fast-reid.git && cd fast-reid && pip install -e .
